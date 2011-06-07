@@ -147,6 +147,7 @@
 -(BOOL)execCommand:(NSString *)sql;
 - (BOOL)execCommand:(NSString *)sql numberOfArguments:(int)nParams withParameters:(id)params,...;
 -(void)execCommandAsync:(NSString *)sql;
+- (PGSQLRecordset *)open:(NSString *)sql numberOfArguments:(int)nParams withParameters:(id)param, ...;
 -(PGSQLRecordset *)open:(NSString *)sql;
 -(void)openAsync:(NSString *)sql;
 
