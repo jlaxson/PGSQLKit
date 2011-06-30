@@ -19,8 +19,14 @@ handle_pq_notice(void *arg, const char *message)
 {
 	PGSQLConnection *theConn = (PGSQLConnection *) arg;
 	//NSLog(@"%s", message);
-	[theConn  appendSQLLog:[NSString stringWithFormat: @"%s\n", message]];
+	[theConn  appendSQLLog:[NSString stringWithFormat: @"Notice: %s\n", message]];
 }
+
+@interface PGSQLConnection (Private)
+
+- (PGresult *) openResult:(NSString *)sql numberOfArguments:(int)nParams withParameters:(va_list)list firstParam:(id)params;
+
+@end
 
 @implementation PGSQLConnection
 
@@ -121,12 +127,16 @@ NSString *const PGSQLCommandDidCompleteNotification = @"PGSQLCommandDidCompleteN
 		[info setValue:[self lastError] forKey:@"Error"];
 	}
 	
-	[[NSNotificationCenter defaultCenter] postNotificationName:PGSQLConnectionDidCompleteNotification
-														object:nil
-													  userInfo:info];
+    [self performSelectorOnMainThread:@selector(connectThreadResults:) withObject:info waitUntilDone:YES];
+	
 	[pool release];
 }
 
+- (void)connectThreadResults:(NSMutableDictionary *)info {
+    [[NSNotificationCenter defaultCenter] postNotificationName:PGSQLConnectionDidCompleteNotification
+														object:self
+													  userInfo:info];
+}
 
 - (BOOL)connect {
 
@@ -198,6 +208,89 @@ NSString *const PGSQLCommandDidCompleteNotification = @"PGSQLCommandDidCompleteN
 	return YES;
 }
 
+- (BOOL)reset
+{
+    PQreset(pgconn);
+    return PQstatus(pgconn) == CONNECTION_OK;
+}
+
+void parseParameters(int numArgs, va_list args, Oid *paramTypes, const char **paramValues, int *paramLengths, int *paramFormats, id firstArg) {
+    id arg = firstArg;
+    for (int i = 0; i < numArgs; i++) {
+        paramTypes[i] = 0; // autodetect datatype
+        paramFormats[i] = 0; // default to textual representation
+        NSString *val = nil;
+        if ([arg isKindOfClass:[NSData class]]) {
+            paramFormats[i] = 1;
+            paramValues[i] = [arg bytes];
+            paramLengths[i] = [arg length];
+        } else {
+            val = arg ? [arg description] : NULL;
+            paramValues[i] = [val cStringUsingEncoding:NSUTF8StringEncoding];
+            paramLengths[i] = 0; // unused for text encoding
+        }
+        
+        
+        arg = va_arg(args, id);
+    }
+    
+}
+
+- (PGresult *) openResult:(NSString *)sql numberOfArguments:(int)nParams withParameters:(va_list)list firstParam:(id)params
+{
+    PGresult* res;
+    
+    Oid paramTypes[nParams];
+    const char *paramValues[nParams];
+    int paramLengths[nParams];
+    int paramFormats[nParams];
+
+    parseParameters(nParams, list, paramTypes, paramValues, paramLengths, paramFormats, params);
+
+	
+	if(errorDescription) {
+		[errorDescription release];
+		errorDescription = nil;	
+	}
+	if(commandStatus) {
+		[commandStatus release];
+		commandStatus = nil;	
+	}
+    
+	if (pgconn == nil) 
+	{ 
+		errorDescription = [NSString stringWithString:@"Object is not Connected."];		
+		[errorDescription retain];
+        [[NSException exceptionWithName:@"PGSQLError" reason:errorDescription userInfo:nil] raise];
+		return NO; 
+	}
+	
+    res = PQexecParams(pgconn, [sql cStringUsingEncoding:defaultEncoding], nParams, paramTypes, paramValues, paramLengths, paramFormats, 0);
+	if (res == nil) 
+	{ 
+		errorDescription = [NSString stringWithString:@"ERROR: No response (PGRES_FATAL_ERROR)"];		
+		[errorDescription retain];
+		return NO; 
+	}
+    ExecStatusType status = PQresultStatus(res);
+	if (status == PGRES_BAD_RESPONSE || status == PGRES_NONFATAL_ERROR || status == PGRES_FATAL_ERROR) 
+	{
+		errorDescription = [NSString stringWithFormat:@"%s", PQerrorMessage(pgconn)];
+		[errorDescription retain];
+        [[NSException exceptionWithName:@"PGSQLError" reason:errorDescription userInfo:nil] raise];
+		PQclear(res);
+		return NULL;
+    }
+	if (strlen(PQcmdStatus(res)))
+	{
+		commandStatus = [NSString stringWithFormat:@"%s", PQcmdStatus(res)];
+		[commandStatus retain];
+		[self appendSQLLog:[NSString stringWithFormat:@"%@\n", commandStatus]];
+	}
+    
+    return res;
+}
+
 - (void)execCommandAsync:(NSString *)sql
 {
 	// perform the connection on a thread
@@ -228,66 +321,21 @@ NSString *const PGSQLCommandDidCompleteNotification = @"PGSQLCommandDidCompleteN
 	return [self execCommand:sql numberOfArguments:0 withParameters:nil];
 }
 
-void parseParameters(int numArgs, va_list args, Oid *paramTypes, const char **paramValues, int *paramLengths, int *paramFormats, id firstArg) {
-    id arg = firstArg;
-    for (int i = 0; i < numArgs; i++) {
-        paramTypes[i] = 0; // autodetect datatype
-        paramFormats[i] = 0; // default to textual representation
-        NSString *val = nil;
-        if ([arg isKindOfClass:[NSData class]]) {
-            paramFormats[i] = 1;
-            paramValues[i] = [arg bytes];
-            paramLengths[i] = [arg length];
-        } else {
-            val = arg ? [arg description] : NULL;
-            paramValues[i] = [val cStringUsingEncoding:NSUTF8StringEncoding];
-            paramLengths[i] = 0; // unused for text encoding
-        }
-        
-        
-        arg = va_arg(args, id);
-    }
 
-}
 
 - (BOOL)execCommand:(NSString *)sql numberOfArguments:(int)nParams withParameters:(id)params,...
 {
     PGresult* res;
     va_list list;
     
-    Oid paramTypes[nParams];
-    const char *paramValues[nParams];
-    int paramLengths[nParams];
-    int paramFormats[nParams];
-    
+        
     va_start(list, params);
     
-    parseParameters(nParams, list, paramTypes, paramValues, paramLengths, paramFormats, params);
+    res = [self openResult:sql numberOfArguments:nParams withParameters:list firstParam:params];
     
     va_end(list);
 	
-	if(errorDescription) {
-		[errorDescription release];
-		errorDescription = nil;	
-	}
-	if(commandStatus) {
-		[commandStatus release];
-		commandStatus = nil;	
-	}
-	if (pgconn == nil) 
-	{ 
-		errorDescription = [NSString stringWithString:@"Object is not Connected."];		
-		[errorDescription retain];
-		return NO; 
-	}
 	
-    res = PQexecParams(pgconn, [sql cStringUsingEncoding:defaultEncoding], nParams, paramTypes, paramValues, paramLengths, paramFormats, 0);
-	if (res == nil) 
-	{ 
-		errorDescription = [NSString stringWithString:@"ERROR: No response (PGRES_FATAL_ERROR)"];		
-		[errorDescription retain];
-		return NO; 
-	}
 	if (PQresultStatus(res) != PGRES_COMMAND_OK) 
 	{
 		errorDescription = [NSString stringWithFormat:@"%s", PQerrorMessage(pgconn)];
@@ -296,14 +344,7 @@ void parseParameters(int numArgs, va_list args, Oid *paramTypes, const char **pa
 		PQclear(res);
 		return NO;
     }
-	if (strlen(PQcmdStatus(res)))
-	{
-		commandStatus = [NSString stringWithFormat:@"%s", PQcmdStatus(res)];
-		[commandStatus retain];
-		[self appendSQLLog:[NSString stringWithFormat:@"%@\n", commandStatus]];
-	}
-    //	results = [[[NSString alloc] initWithCString:PQcmdTuples(res)] autorelease];
-	
+    
 	PQclear(res);	
 	return YES;	
 }
@@ -339,53 +380,16 @@ void parseParameters(int numArgs, va_list args, Oid *paramTypes, const char **pa
 
 - (PGSQLRecordset *)open:(NSString *)sql numberOfArguments:(int)nParams withParameters:(id)params, ...
 {
-	struct timeval start, finished;
-	double elapsed_time;
-	long seconds, usecs;
 	PGresult* res;
-	
-	[errorDescription release];
-	errorDescription = nil;
-    
-    Oid paramTypes[nParams];
-    const char *paramValues[nParams];
-    int paramLengths[nParams];
-    int paramFormats[nParams];
-    
+
     va_list list;
     va_start(list, params);
     
-    parseParameters(nParams, list, paramTypes, paramValues, paramLengths, paramFormats, params);
+    res = [self openResult:sql numberOfArguments:nParams withParameters:list firstParam:params];
     
     va_end(list);
 	
-	if (pgconn == nil) 
-	{ 
-		errorDescription = @"Object is not Connected.";	
-		[self appendSQLLog:@"Object is not Connected.\n"];
-		return nil; 
-	}
 	
-	if (logSQL)
-	{
-		[self appendSQLLog: [NSString stringWithFormat:@"%@\n", [sql stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]]];
-	}
-	
-	gettimeofday(&start, 0);
-	res = PQexecParams(pgconn, [sql cStringUsingEncoding:defaultEncoding], nParams, paramTypes, paramValues, paramLengths, paramFormats, 0);
-	if (logInfo)
-	{
-		gettimeofday(&finished, 0);
-		seconds = finished.tv_sec - start.tv_sec;
-		usecs = finished.tv_usec - start.tv_usec;
-		if (usecs < 0)
-		{
-			seconds--;
-			usecs = usecs + 1000000;
-		}
-		elapsed_time = (double) seconds *1000.0 + (double) usecs *0.001;
-		[self appendSQLLog: [NSString stringWithFormat: @"Completed in %d milliseconds.\n", (long) elapsed_time]];
-	}
 	switch (PQresultStatus(res))
 	{
 		case PGRES_TUPLES_OK:
@@ -425,9 +429,6 @@ void parseParameters(int numArgs, va_list args, Oid *paramTypes, const char **pa
 			
 		case PGRES_COPY_OUT:
 		case PGRES_COPY_IN:
-		case PGRES_BAD_RESPONSE:
-		case PGRES_NONFATAL_ERROR:
-		case PGRES_FATAL_ERROR:
 		default:
 		{
 			errorDescription = [NSString stringWithFormat:@"PostgreSQL Error: %s", PQresultErrorMessage(res)];

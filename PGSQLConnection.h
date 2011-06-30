@@ -139,6 +139,7 @@
 -(BOOL)close;
 -(BOOL)connect;
 -(void)connectAsync;
+-(BOOL)reset;
 -(NSMutableString *)makeConnectionString;
 
 #pragma mark -
